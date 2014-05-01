@@ -91,25 +91,9 @@
 
 (defn conj [g1 g2]
   (let [[s ret] (duplex-pipe)]
-    (go (loop []
-          (let [[v ch] (alts! [s g1 g2])]
-            (condp identical? ch
-              s (if (nil? v)
-                  (do (close! g1)
-                      (close! g2)
-                      (close! s))
-                  (do (>! g1 v)
-                      (recur)))
-              g1 (if (nil? v)
-                   (do (close! g2)
-                       (close! s))
-                   (do (>! g2 v)
-                       (recur)))
-              g2 (if (nil? v)
-                   (close! ret)
-                   (do (>! s v)
-                       (recur)))
-              (assert false (pr-str ch))))))
+    (async/pipe s g1)
+    (async/pipe (async/remove< false? g1) g2)
+    (async/pipe (async/remove< false? g2) s)
     ret))
 
 (defn disj [g1 g2]
@@ -122,12 +106,7 @@
 
 (defn == [a b]
   (let [[s ret] (duplex-pipe)]
-    (go (loop []
-          (let [v (<! s)]
-            (if (nil? v)
-              (close! s)
-              (do (>! s (unify a b v))
-                  (recur))))))
+    (async/pipe (async/map< #(unify a b %) s) s)
     ret))
 
 (defn test-x [x]

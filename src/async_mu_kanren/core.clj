@@ -1,14 +1,29 @@
 (ns async-mu-kanren.core
   (:refer-clojure :exclude [conj disj merge ==])
   (:require [clojure.core.async :refer [<! >! chan close! <!! >!! alts!!] :as async]
-            [clojure.core.async.impl.protocols :as impl]))
+            [clojure.core.async.impl.protocols :as impl]
+            [clojure.core.logic :as l]
+            [clojure.core.logic.protocols :as lp]))
 
+;; An implementation of muKanren (http://webyrd.net/scheme-2013/papers/HemannMuKanren2013.pdf)
+;; using core.async channels (CSP) instead of lazy streams and using CSP processes instead
+;; of monads
+
+;; Helper to print out stacktraces when gos fail
 (defmacro go [& body]
   `(async/go (try
                ~@body
                (catch Throwable ex#
                  (clojure.stacktrace/print-stack-trace ex#)
                  (println "--")))))
+
+;; Goals will return a single channel. Items put into this channel will be processed by the goal
+;; and then the result can be taken from this same channel. Notice this is completely different
+;; from standard CSP channels, which only allow simplex communication. We're going to leverage
+;; core.async's interfaces to create a duplex channel.
+
+;; This function will return two channel like things items put into the first channel can be read
+;; from the second and vice-versa.
 
 (defn duplex-pipe
   "Defines two connected duplex channels"
@@ -42,133 +57,198 @@
        (closed? [this]
          (impl/closed? c<-)))]))
 
+;; Logging helpers, call log to print data to the console without the output
+;; getting clobbered by other processes
+(let [c (chan)]
+  (go (loop []
+        (println (<! c))
+        (recur)))
+  (defn log [& args]
+    (async/>!! c (vec args))))
 
-(def empty-state {})
-
-(defrecord LVar [name])
-
-(defn lvar
-  ([]
-   (lvar (gensym "lvar_")))
-  ([name]
-   (->LVar name)))
-
-(defn lvar? [x]
-  (instance? LVar x))
-
-
-(defn walk [u s]
-  (if-let [pr (and (lvar? u)
-                (get s u nil))]
-    (recur pr s)
-    u))
-
-(defn ext-s [x v s]
-  (assoc s x v))
-
-(defn == [u v]
-  ())
-
-(defn unify [u v s]
-  (let [u (walk u s)
-        v (walk v s)]
-    (cond
-      (and (lvar? u)
-           (lvar? v)
-           (= u v)) s
-
-      (lvar? u) (ext-s u v s)
-
-      (lvar? v) (ext-s v u s)
-
-      (and (seq? u)
-           (seq? v)) (let [s (unify (first u) (first v) s)]
-                       (and s (unify (next u) (next v) s)))
-
-      :else (and (= u v) s))))
-
-(unify (lvar 4) 4 {})
-
+;; muKanren defines conj as a goal that takes two goals, passing results to the second
+;; only if the fist passes. If we assume goals will not return a value if the goal fails,
+;; then we can easily define conj in terms of pipe.
 (defn conj
   ([g1] g1)
   ([g1 g2]
    (let [[s ret] (duplex-pipe)]
      (async/pipe s g1)
-     (async/pipe (async/remove< false? g1) g2)
-     (async/pipe (async/remove< false? g2) s)
+     (async/pipe g1 g2)
+     (async/pipe g2 s)
      ret))
   ([g1 g2 & more]
-   (apply conj (conj g1 g2) more)))
+   (conj g1 (apply conj g1 more))))
 
+;; disj is defined as a parallel trying of two goals. Core.async supplies broadcast facilities
+;; in the form of `mux` we will leverage these and pipe the resuls form the gos to the output
 (defn disj [& goals]
   (let [[s ret] (duplex-pipe)
         m (async/mult s)]
     (doseq [g goals]
-      (async/tap m g))
-    (async/pipe (async/merge (vec goals)) s)
+      (async/tap m g)
+      (async/pipe g s))
     ret))
 
+;; unification goal. Originally this code used a custom unifier as specified in the paper above,
+;; instead we now leverage the unification engine of Core.Logic. This this allows us to take advantage
+;; of things like LCons with minimal effort.
+
+;; the unification gal can be define din therms of pipe map and removal of nils.
 (defn == [a b]
   (let [[s ret] (duplex-pipe)]
-    (async/pipe (async/map< #(unify a b %) s) s)
+    (async/pipe
+      s
+      (async/map> (fn [s]
+                    #_(log [s a b])
+                    (l/unify s a b))
+            (async/remove> nil? s)))
     ret))
 
-(defn test-x [x]
-  (let [a (== (lvar 'f) x)
-        b (== (lvar 's) (lvar 'f))
-        u (conj a b)]
-    u))
-
+;; fresh defines lvars in an outer let and then simply applies conj to all the goals in the body
 (defmacro fresh [lvars & goals]
-  `(let ~(vec (mapcat (fn [var]
-                         `[~var (lvar (gensym ~(name var)))])
-                       lvars))
-     ~(if (> (count goals) 1)
-        `(conj ~@goals)
-        (first goals))))
+  `(let [~@(vec (mapcat (fn [var]
+                         `[~var (l/lvar ~(name var))])
+                       lvars))]
+    ~(if (> (count goals) 1)
+       `(conj ~@goals)
+       (first goals))))
 
+;; conde is a disj wrapping bodies wrapped in conj
 (defn conde [& goals]
   (apply disj (map (partial apply conj) goals)))
 
+;; given a set of lvars, pull walk them from the substitution map and return a seq of the resulting values.
 (defn -run-chan [lvars g]
   (let [[s ret] (duplex-pipe)]
     (async/pipe s g)
     (async/pipe (async/map< (fn [s]
-                              (map #(walk % s) lvars))
+                              (map #(lp/walk s %) lvars))
                             g)
                 s)
     ret))
 
+;; like core.logic's run-lazy but returns a channel
 (defmacro run-chan [lvars & goals]
   `(let [lvars# ~(vec (map (fn [var]
-                            `(lvar (gensym ~(name var))))
-                          lvars))
+                             `(l/lvar (gensym ~(name var))))
+                           lvars))
          ~lvars lvars#
          r# ~(if (> (count goals) 1)
                `(conj ~@goals)
                (first goals))]
      (-run-chan lvars# r#)))
 
-(macroexpand '(run-chan [q] (== q 1)))
+(defn close-after [msec c]
+  (go (<! (async/timeout msec))
+      (close! c))
+  c)
 
-(let [a (test-x 42)
-      b (test-x 43)
-      u (disj a b)
-      #_u #_(fresh [x y z]
-               (== z y)
-               (== x 1)
-               (== x y))
-      u (conde
-          [(fresh [x y]
-                  (== x 2)
-                  (== y 1))]
-          [(fresh [z]
-                  (== z 4))])
-      u (run-chan [q v]
-                  (== q 1)
-                  (== v 1))]
-  (>!! u empty-state)
-  (prn (alts!! [u (async/timeout 1000)]
-               ))
-  (prn (alts!! [u (async/timeout 1000)]
-               )))
+;; Runs until n items have been found, or returns
+(defmacro run [n timeout args & body]
+  `(let [r# (run-chan ~args ~@body)
+         t# (async/timeout ~timeout)]
+     (>!! r# l/empty-s)
+     (<!! (async/into [] (async/take ~n (close-after ~timeout r#))))))
+
+
+(async/alt!! (async/timeout 100) ([_] _))
+
+(defn emptyo
+  [a]
+  (== '() a))
+
+(defn conso
+  [a d l]
+  (== (l/lcons a d) l))
+
+(defn firsto
+  [l a]
+  (fresh [d]
+         (conso a d l)))
+
+(defn resto
+  [l d]
+  (fresh [a]
+         (conso a d l)))
+
+
+;; Helper for delay goal
+(defn sink [c f]
+  (go (loop []
+        (let [v# (<! c)]
+          (when (not (nil? v#))
+            (f v#)
+            (recur))))))
+
+;; Unlike monad based kanren implementations, this CSP implementation eagerly creates graphs
+;; before execution. This can cause a stack overflow on recursive goals. This macro makes
+;; a goal lazy, that is, it's CSP dataflow will not be created until needed. And even then
+;; it will be destroyed and recreated for each substitution.
+
+;; TODO - Figure out if it is possible to have a goal be recursive by having it's body feed
+;; back into its input
+
+(defmacro delay-goal [goal]
+  `(let [[s# ret#] (duplex-pipe)
+         make-goal# (fn [] ~goal)]
+     (sink s# (fn [sub#]
+                (let [goal# (make-goal#)]
+                  (async/put! goal# sub#)
+                  (async/pipe goal# s#))))
+     ret#))
+
+;; Define membero, and don't forget to delay the recursive call.
+(defn membero [x col]
+  (conde
+    [(firsto col x)]
+    [(fresh [tail]
+            (resto col tail)
+            (delay-goal (membero x tail)))]))
+
+;; Some simple examples
+
+(run 2 1000 [q]
+     (conde
+       [(== q 1)]
+       [(== q 2)]))
+
+(run 4 1000 [q]
+     (membero q '(1 2 3 4)))
+
+;; Only one answer, so times out after 1000 ms
+
+(run 2 1000 [q]
+     (membero q '(3 4))
+     (membero q '(1 2 3 4))
+     (membero q '(4)))
+
+
+;; Async goals are possible
+
+;; Put items onto a channel, but wait ms milliseconds inbetween each item.
+(defn onto-chan-limit [c ms coll]
+  (go (doseq [x coll]
+        (<! (async/timeout ms))
+        (>! c x))))
+
+;; Non relational. Given a lvar 'max' unify with 0-max, but do it slowly,
+;; one unification a second.
+(defn upto [max out]
+  (let [[s ret] (duplex-pipe)]
+    (sink s (fn [a]
+              (let [max (lp/walk a max)]
+                (assert (not (l/lvar? max)) "max must be bound")
+                (->> (range max)
+                     (map (partial l/unify a out))
+                     (onto-chan-limit s 1000)))))
+    ret))
+
+
+;; Notice how the results slowly arrive, even though the CPU is idle
+(let [rc (run-chan [q]
+                   (upto 100 q))]
+  (>!! rc l/empty-s)
+  (dotimes [x 10]
+    (println (<!! rc))))
+

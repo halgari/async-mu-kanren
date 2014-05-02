@@ -186,7 +186,7 @@
 ;; a goal lazy, that is, it's CSP dataflow will not be created until needed. And even then
 ;; it will be destroyed and recreated for each substitution.
 
-;; TODO - Figure out if it is possible to have a goal be recursive by having it's body feed
+;; TODO - Figure out if it is possible to have a goal be recursive by having its body feed
 ;; back into its input
 
 (defmacro delay-goal [goal]

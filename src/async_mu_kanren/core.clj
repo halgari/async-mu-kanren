@@ -89,19 +89,23 @@
 
 (unify (lvar 4) 4 {})
 
-(defn conj [g1 g2]
-  (let [[s ret] (duplex-pipe)]
-    (async/pipe s g1)
-    (async/pipe (async/remove< false? g1) g2)
-    (async/pipe (async/remove< false? g2) s)
-    ret))
+(defn conj
+  ([g1] g1)
+  ([g1 g2]
+   (let [[s ret] (duplex-pipe)]
+     (async/pipe s g1)
+     (async/pipe (async/remove< false? g1) g2)
+     (async/pipe (async/remove< false? g2) s)
+     ret))
+  ([g1 g2 & more]
+   (apply conj (conj g1 g2) more)))
 
-(defn disj [g1 g2]
+(defn disj [& goals]
   (let [[s ret] (duplex-pipe)
         m (async/mult s)]
-    (async/tap m g1)
-    (async/tap m g2)
-    (async/pipe (async/merge [g1 g2]) s)
+    (doseq [g goals]
+      (async/tap m g))
+    (async/pipe (async/merge (vec goals)) s)
     ret))
 
 (defn == [a b]
@@ -115,9 +119,54 @@
         u (conj a b)]
     u))
 
+(defmacro fresh [lvars & goals]
+  `(let ~(vec (mapcat (fn [var]
+                         `[~var (lvar (gensym ~(name var)))])
+                       lvars))
+     ~(if (> (count goals) 1)
+        `(conj ~@goals)
+        (first goals))))
+
+(defn conde [& goals]
+  (apply disj (map (partial apply conj) goals)))
+
+(defn -run-chan [lvars g]
+  (let [[s ret] (duplex-pipe)]
+    (async/pipe s g)
+    (async/pipe (async/map< (fn [s]
+                              (map #(walk % s) lvars))
+                            g)
+                s)
+    ret))
+
+(defmacro run-chan [lvars & goals]
+  `(let [lvars# ~(vec (map (fn [var]
+                            `(lvar (gensym ~(name var))))
+                          lvars))
+         ~lvars lvars#
+         r# ~(if (> (count goals) 1)
+               `(conj ~@goals)
+               (first goals))]
+     (-run-chan lvars# r#)))
+
+(macroexpand '(run-chan [q] (== q 1)))
+
 (let [a (test-x 42)
       b (test-x 43)
-      u (disj a b)]
+      u (disj a b)
+      #_u #_(fresh [x y z]
+               (== z y)
+               (== x 1)
+               (== x y))
+      u (conde
+          [(fresh [x y]
+                  (== x 2)
+                  (== y 1))]
+          [(fresh [z]
+                  (== z 4))])
+      u (run-chan [q v]
+                  (== q 1)
+                  (== v 1))]
   (>!! u empty-state)
   (prn (alts!! [u (async/timeout 1000)]
                ))
